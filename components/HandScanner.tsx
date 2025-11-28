@@ -66,6 +66,11 @@ export const HandScanner: React.FC<HandScannerProps> = ({ isActive, videoElement
   const pinchGaugeRef = useRef<number>(0); // For visualization 0..1
   const isOverPaletteRef = useRef<boolean>(false); // Track palette state
   
+  // Painter Physics State
+  const brushPhysicsRef = useRef<{x: number, y: number}>({ x: 0.5, y: 0.5 });
+  const strokeStartTimeRef = useRef<number>(0);
+  const wasPaintingRef = useRef<boolean>(false);
+
   // Smoothing State
   const smoothedLandmarksRef = useRef<{
       index: Point3D,
@@ -168,6 +173,11 @@ export const HandScanner: React.FC<HandScannerProps> = ({ isActive, videoElement
           y: current.y + (target.y - current.y) * alpha,
           z: current.z + (target.z - current.z) * alpha
       };
+  };
+
+  // Helper for Linear Interpolation
+  const lerp = (start: number, end: number, factor: number) => {
+    return start + (end - start) * factor;
   };
 
   useEffect(() => {
@@ -331,6 +341,7 @@ export const HandScanner: React.FC<HandScannerProps> = ({ isActive, videoElement
               if (levelId !== DifficultyLevel.PAINTER) {
                   drawSkeleton(ctx, landmarks, isPrimary ? smoothedLandmarksRef.current : undefined);
               } else {
+                  // Painter specific cursor drawing
                   drawPainterCursor(ctx, landmarks, isPrimary ? smoothedLandmarksRef.current : undefined);
               }
             });
@@ -715,13 +726,26 @@ export const HandScanner: React.FC<HandScannerProps> = ({ isActive, videoElement
     const indexOut = isExtended(indexTip, landmarks[6]); 
 
     if (levelId === DifficultyLevel.ARCADE) {
-        // ... (Arcade Logic remains same)
-        const thumbGunWidth = dist(thumbTip, indexMCP);
-        const hasGunWidth = thumbGunWidth > (0.5 * handScale);
-        const middleTight = isCurled(middleTip, middleMCP);
-        const ringTight = isCurled(ringTip, ringMCP);
-        const pinkyTight = isCurled(pinkyTip, pinkyMCP);
-        const isFingerGun = indexOut && hasGunWidth && middleTight && ringTight && pinkyTight;
+        // Robust Finger Gun Logic
+        // 1. Index must be extended (Checked above)
+        
+        // 2. Thumb Position: Must be extended away from index finger (creating L shape)
+        const thumbDistToIndexMCP = dist(thumbTip, indexMCP);
+        // Thumb tip must be far enough from index base to be "out"
+        const isThumbExtended = thumbDistToIndexMCP > (0.6 * handScale);
+
+        // 3. Middle, Ring, Pinky must be STRICTLY closed
+        // We use the existing isCurled, but double check with strictness if needed
+        const middleClosed = isCurled(middleTip, middleMCP);
+        const ringClosed = isCurled(ringTip, ringMCP);
+        const pinkyClosed = isCurled(pinkyTip, pinkyMCP);
+        
+        // Also ensure middle tip is not too far from wrist (prevent loose curl)
+        const middleToWrist = dist(middleTip, wrist);
+        const middleWristThreshold = 1.2 * dist(middleMCP, wrist); 
+        const isStrictlyClosed = middleToWrist < middleWristThreshold;
+
+        const isFingerGun = indexOut && isThumbExtended && middleClosed && ringClosed && pinkyClosed && isStrictlyClosed;
         
         if (isFingerGun) {
             if (!interactionRef.current.isPointing) {
@@ -743,59 +767,96 @@ export const HandScanner: React.FC<HandScannerProps> = ({ isActive, videoElement
         // Pinch (Index + Thumb) = Click/Paint
         
         const pinchDist = dist(thumbTip, indexTip);
-        
-        // --- IMPROVED PINCH SENSITIVITY ---
-        // Relaxed thresholds significantly for easier painting
-        // Typical handScale is ~0.1 to 0.15
-        const PINCH_START = 0.12; 
-        const PINCH_END = 0.15;
+        const PINCH_THRESHOLD_START = 0.12; 
+        const PINCH_THRESHOLD_END = 0.15;
 
-        // Visual Gauge Calculation:
-        // Map distance [PINCH_START * 2 -> PINCH_START] to 0 -> 1
-        const range = PINCH_START;
-        const rawProgress = (PINCH_START * 2) - pinchDist;
-        const gauge = Math.min(1, Math.max(0, rawProgress / range));
-        pinchGaugeRef.current = gauge;
+        // Visual Gauge & Pressure
+        // Map distance to pressure: 0.02 (touching) -> 1.0 pressure, 0.12 (threshold) -> 0.0 pressure
+        const minPinch = 0.02;
+        const maxPinch = PINCH_THRESHOLD_START;
+        const rawPressure = 1.0 - Math.min(1.0, Math.max(0, (pinchDist - minPinch) / (maxPinch - minPinch)));
+        pinchGaugeRef.current = rawPressure; // 1 = tight, 0 = loose
 
         if (isPinchingRef.current) {
-            // Check for release (Hysteresis)
-            if (pinchDist > PINCH_END) {
-                isPinchingRef.current = false;
-            }
+            // Hysteresis: Keep pinching until far enough apart
+            if (pinchDist > PINCH_THRESHOLD_END) isPinchingRef.current = false;
         } else {
-            // Check for start
-            if (pinchDist < PINCH_START) {
-                isPinchingRef.current = true;
-            }
+            // Start pinching
+            if (pinchDist < PINCH_THRESHOLD_START) isPinchingRef.current = true;
         }
 
-        // Reduced Block Zone to just 11% of edge
         const isOverPalette = indexTip.x < 0.11; 
         isOverPaletteRef.current = isOverPalette;
 
         if (isPinchingRef.current && !isOverPalette) {
             interactionRef.current.isPainting = true;
             
+            // --- PHYSICS: Drag & Tapering ---
+            if (!wasPaintingRef.current) {
+                // START OF STROKE
+                strokeStartTimeRef.current = performance.now();
+                // Snap brush to finger on start so it doesn't fly in
+                brushPhysicsRef.current = { x: 1 - indexTip.x, y: indexTip.y };
+            }
+
+            // Drag/Resistance: Lerp brush towards finger
+            // Lower factor = More resistance (feels heavier/more precise)
+            // We use a very low factor for that "dragging through fluid" feel
+            const DRAG_FACTOR = 0.12; 
+            const targetX = 1 - indexTip.x;
+            const targetY = indexTip.y;
+            brushPhysicsRef.current.x = lerp(brushPhysicsRef.current.x, targetX, DRAG_FACTOR);
+            brushPhysicsRef.current.y = lerp(brushPhysicsRef.current.y, targetY, DRAG_FACTOR);
+            
+            // Calculate Velocity based size modulation
+            // Faster = Thinner, Slower = Thicker (Ink flow physics)
+            const vx = interactionRef.current.velocityX;
+            const vy = interactionRef.current.velocityY;
+            const speed = Math.hypot(vx, vy);
+            
+            // Speed Factor: 
+            // Stationary (0 speed) -> 1.2x size
+            // Fast (5+ speed) -> 0.4x size
+            const speedFactor = Math.max(0.4, Math.min(1.4, 1.2 - (speed * 0.15)));
+
+            // Start Taper: Ramp up size over first 150ms
+            const duration = performance.now() - strokeStartTimeRef.current;
+            const startTaper = Math.min(1, duration / 150);
+            
+            // Pressure Taper: Use the pinch distance as pressure
+            // Tighter pinch = 1.0, Looser pinch (near release) = 0.2
+            // This creates a taper at the END of the stroke as you release
+            const pressureTaper = Math.max(0.1, rawPressure);
+
+            const finalSize = 1.0 * speedFactor * startTaper * pressureTaper;
+
             // Push to local frame accumulator
             frameCursors.push({
                 id: 'index',
-                x: 1 - indexTip.x, // Mirror for 3D Scene
-                y: indexTip.y,
+                x: brushPhysicsRef.current.x, // Use dragged physics position
+                y: brushPhysicsRef.current.y,
                 z: indexTip.z,
                 vx: 0,
                 vy: 0,
                 color: interactionRef.current.activeColor,
-                size: 1
+                size: finalSize
             });
+            
+            wasPaintingRef.current = true;
         } else {
             interactionRef.current.isPainting = false;
+            wasPaintingRef.current = false;
+            
+            // Move physics brush to finger so it's ready for next hover
+            brushPhysicsRef.current = { x: 1 - indexTip.x, y: indexTip.y };
         }
     }
 
     if (levelId === DifficultyLevel.GARDEN) {
         const pinchDist = dist(thumbTip, indexTip);
-        const GRAB_THRESHOLD = 0.8 * handScale; 
-        const RELEASE_THRESHOLD = 1.5 * handScale; 
+        // Made thresholds more forgiving
+        const GRAB_THRESHOLD = 1.0 * handScale; // Was 0.8
+        const RELEASE_THRESHOLD = 1.8 * handScale; // Was 1.5
 
         if (interactionRef.current.isGrabbing) {
             if (pinchDist > RELEASE_THRESHOLD) {
@@ -873,13 +934,14 @@ export const HandScanner: React.FC<HandScannerProps> = ({ isActive, videoElement
       const gauge = pinchGaugeRef.current; // 0..1
       const isOverPalette = isOverPaletteRef.current;
 
-      // Draw cursor tip
-      ctx.beginPath();
-      const r = isPainting ? 20 : 10; // Larger for visibility
-      ctx.arc(indexTip.x * w, indexTip.y * h, r, 0, 2 * Math.PI);
+      // Draw cursor tip (User's actual finger pos)
+      // If painting, we also have the 'brush' physics position which lags, 
+      // but showing the actual finger is better for 'aiming'.
       
       if (isOverPalette) {
           // X Icon for Palette Zone
+          ctx.beginPath();
+          ctx.arc(indexTip.x * w, indexTip.y * h, 10, 0, 2 * Math.PI);
           ctx.strokeStyle = "rgba(200, 200, 200, 0.5)";
           ctx.lineWidth = 2;
           ctx.stroke();
@@ -894,21 +956,39 @@ export const HandScanner: React.FC<HandScannerProps> = ({ isActive, videoElement
           ctx.stroke();
           
       } else if (isPainting) {
-          // ACTIVE PAINTING: Solid Blob
+          // Draw the PHYSICS brush position to show the lag/weight
+          // We must mirror X for canvas drawing to match video
+          const physicsX = (1 - brushPhysicsRef.current.x) * w;
+          const physicsY = brushPhysicsRef.current.y * h;
+          
+          // Brush Head
+          ctx.beginPath();
+          ctx.arc(physicsX, physicsY, 8, 0, 2 * Math.PI);
           ctx.fillStyle = color;
           ctx.fill();
           
-          ctx.strokeStyle = "white";
-          ctx.lineWidth = 4;
+          // Connect finger to brush with a thin line (string)
+          // Indicates the "drag" feel visually
+          ctx.beginPath();
+          ctx.moveTo(indexTip.x * w, indexTip.y * h);
+          ctx.lineTo(physicsX, physicsY);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 4]); // Dotted line for "connection"
           ctx.stroke();
           
-          // Glow
-          ctx.shadowColor = color;
-          ctx.shadowBlur = 40;
+          // Active Glow
+          ctx.beginPath();
+          ctx.arc(physicsX, physicsY, 12, 0, 2 * Math.PI);
+          ctx.strokeStyle = "white";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([]);
           ctx.stroke();
           
       } else {
           // HOVER STATE
+          ctx.beginPath();
+          ctx.arc(indexTip.x * w, indexTip.y * h, 10, 0, 2 * Math.PI);
           ctx.strokeStyle = color;
           ctx.lineWidth = 3;
           ctx.stroke();

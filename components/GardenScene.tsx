@@ -1,3 +1,4 @@
+
 import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { GardenEvent, GardenInteractionState, DifficultyLevel } from '../types';
@@ -18,12 +19,17 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const flowersRef = useRef<THREE.Group | null>(null);
   const particlesRef = useRef<THREE.Group | null>(null);
-  const ripplesRef = useRef<THREE.Group | null>(null);
-  const brushStrokesRef = useRef<THREE.Group | null>(null); // Painter Mode
   const audioContextRef = useRef<AudioContext | null>(null);
   
-  // Optimization: Shared Geometries
+  // --- PAINTER MODE: Render Target System ---
+  const paintRT = useRef<THREE.WebGLRenderTarget | null>(null);
+  const brushScene = useRef<THREE.Scene | null>(null);
+  const paintQuad = useRef<THREE.Mesh | null>(null);
   const sharedBrushGeoRef = useRef<THREE.BufferGeometry | null>(null);
+  
+  // Impasto Textures
+  const brushColorMapRef = useRef<THREE.Texture | null>(null);
+  const brushNormalMapRef = useRef<THREE.Texture | null>(null);
   
   // Interaction State
   const groundRef = useRef<THREE.Mesh | null>(null);
@@ -159,59 +165,148 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
       }
   };
 
-  // --- Painter: Spawn Brush Particle ---
-  const spawnBrushParticle = (x: number, y: number, z: number, color: string, size: number, vx: number, vy: number) => {
-    if (!brushStrokesRef.current || !sharedBrushGeoRef.current) return;
+  // --- Impasto Texture Generation ---
+  const createImpastoBrush = () => {
+    const size = 128;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
 
-    // Increased scale for better visibility
-    const baseScale = size === 2 ? 0.9 : 0.6; 
+    const cx = size / 2;
+    const cy = size / 2;
     
-    // Switch to MeshBasicMaterial for guaranteed visibility (Unlit)
-    const mat = new THREE.MeshBasicMaterial({ 
+    // 1. Generate Height Map (Black bg, White peaks)
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, size, size);
+
+    // Main shape falloff
+    const gradient = ctx.createRadialGradient(cx, cy, size * 0.1, cx, cy, size * 0.5);
+    gradient.addColorStop(0, 'rgba(255, 255, 255, 1.0)'); 
+    gradient.addColorStop(0.5, 'rgba(255, 255, 255, 0.5)');
+    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, size, size);
+    
+    // 2. Add Bristle Texture (Streaks) to Height Map
+    // We want grooves to be darker (lower)
+    ctx.globalCompositeOperation = 'multiply'; 
+    ctx.strokeStyle = '#cccccc'; // Grey streaks
+    
+    for (let i = 0; i < 80; i++) {
+        const x = Math.random() * size;
+        const width = size * 0.8;
+        const y = Math.random() * size;
+        
+        ctx.beginPath();
+        ctx.moveTo(x - width/2, y);
+        // Slightly wavy bristles
+        ctx.bezierCurveTo(x - width/4, y + Math.random()*4, x + width/4, y - Math.random()*4, x + width/2, y);
+        ctx.lineWidth = 1 + Math.random() * 2;
+        ctx.stroke();
+    }
+    
+    // 3. Generate Normal Map from Height Data
+    const imgData = ctx.getImageData(0, 0, size, size);
+    const data = imgData.data;
+    const normalData = new Uint8Array(size * size * 4);
+    
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            const i = (y * size + x) * 4;
+            const h = data[i] / 255.0; // Greyscale height
+            
+            // Neighbors
+            const x1 = Math.min(x + 1, size - 1);
+            const y1 = Math.min(y + 1, size - 1);
+            const iX = (y * size + x1) * 4;
+            const iY = (y1 * size + x) * 4;
+            
+            const hX = data[iX] / 255.0;
+            const hY = data[iY] / 255.0;
+            
+            // Calculate slope
+            const scale = 15.0; // Relief depth
+            const dx = (h - hX) * scale;
+            const dy = (h - hY) * scale;
+            const dz = 1.0;
+            
+            const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            
+            // Map -1..1 to 0..255
+            normalData[i]   = ((dx/len) * 0.5 + 0.5) * 255;
+            normalData[i+1] = ((dy/len) * 0.5 + 0.5) * 255;
+            normalData[i+2] = ((dz/len) * 0.5 + 0.5) * 255;
+            normalData[i+3] = 255;
+        }
+    }
+    
+    const normalTex = new THREE.DataTexture(normalData, size, size, THREE.RGBAFormat);
+    normalTex.needsUpdate = true;
+    
+    // 4. Generate Color/Alpha Map
+    // We reuse the height map canvas but make it White + Alpha
+    const colorData = imgData.data;
+    for (let i = 0; i < colorData.length; i+=4) {
+        const val = colorData[i]; // Height value
+        colorData[i] = 255; // R
+        colorData[i+1] = 255; // G
+        colorData[i+2] = 255; // B
+        colorData[i+3] = val; // A = Height (Soft edges)
+    }
+    ctx.putImageData(imgData, 0, 0);
+    const colorTex = new THREE.CanvasTexture(canvas);
+
+    return { colorTex, normalTex };
+  };
+
+  // --- Painter: Splat Brush to Texture ---
+  const spawnBrushSplat = (x: number, y: number, z: number, color: string, size: number, rotation: number) => {
+    if (!brushScene.current || !sharedBrushGeoRef.current || !brushColorMapRef.current || !brushNormalMapRef.current) return;
+
+    // Use Standard Material for PBR (Lighting) interaction
+    const mat = new THREE.MeshStandardMaterial({ 
         color: color, 
-        transparent: false, // Force solid
+        map: brushColorMapRef.current,
+        normalMap: brushNormalMapRef.current,
+        normalScale: new THREE.Vector2(2, 2), // Deep ridges
+        roughness: 0.3, // Shiny like oil
+        metalness: 0.1,
+        transparent: true,
         opacity: 1.0, 
-        side: THREE.DoubleSide,
-        depthWrite: false, // Always on top of everything
-        depthTest: false   // Always on top of everything
+        depthTest: false,
+        depthWrite: false,
+        side: THREE.DoubleSide
     });
     
     const mesh = new THREE.Mesh(sharedBrushGeoRef.current, mat);
-    
-    // Fixed Z to ensure consistency
     mesh.position.set(x, y, z);
-    // Use renderOrder to stack strokes correctly
-    mesh.renderOrder = brushStrokesRef.current.children.length + 1;
-
-    mesh.scale.set(baseScale, baseScale, 1);
+    mesh.rotation.z = rotation;
     
-    brushStrokesRef.current.add(mesh);
+    // Slight random scale variance for organic feel
+    const scaleVar = 0.9 + Math.random() * 0.2;
+    mesh.scale.set(size * scaleVar, size * scaleVar, 1);
     
-    // Increased buffer for longer drawings
-    if (brushStrokesRef.current.children.length > 5000) {
-        const old = brushStrokesRef.current.children[0];
-        brushStrokesRef.current.remove(old);
-        if ((old as THREE.Mesh).material) (old as THREE.Mesh).material.dispose();
-    }
+    brushScene.current.add(mesh);
   };
 
   // --- EFFECT: Event Handling Only ---
   useEffect(() => {
-    // Listen for clear events
     if (activeEvent === 'RESET') {
-        if (brushStrokesRef.current) {
-            // Dispose all strokes
-            while(brushStrokesRef.current.children.length > 0){ 
-                const child = brushStrokesRef.current.children[0];
-                brushStrokesRef.current.remove(child);
-                if ((child as THREE.Mesh).material) (child as THREE.Mesh).material.dispose();
-            }
+        // Clear Render Target
+        if (paintRT.current && rendererRef.current) {
+            const oldTarget = rendererRef.current.getRenderTarget();
+            rendererRef.current.setRenderTarget(paintRT.current);
+            rendererRef.current.clear();
+            rendererRef.current.setRenderTarget(oldTarget);
         }
+        
         if (flowersRef.current) {
             flowersRef.current.clear();
         }
         playResetSound();
-        // Visual flash (only if not in painter mode where transparency matters)
         if (sceneRef.current && levelId !== DifficultyLevel.PAINTER) {
             sceneRef.current.background = new THREE.Color(0xffffff);
             setTimeout(() => {
@@ -219,9 +314,9 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
             }, 100);
         }
     }
-  }, [activeEvent]); // ONLY reset on activeEvent trigger
+  }, [activeEvent]);
 
-  // --- EFFECT: Initialization & Loop (Runs once per levelId) ---
+  // --- EFFECT: Initialization & Loop ---
   useEffect(() => {
     if (!mountRef.current) return;
 
@@ -230,14 +325,13 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
     
     const renderer = new THREE.WebGLRenderer({ 
         antialias: true, 
-        alpha: true, // Crucial for AR
-        preserveDrawingBuffer: true // Crucial for Screenshot/Save
+        alpha: true, 
+        preserveDrawingBuffer: true 
     });
     
-    // TRANSPARENCY for AR Mode in Painter
     if (levelId === DifficultyLevel.PAINTER) {
         scene.background = null; 
-        renderer.setClearColor(0x000000, 0); // Explicitly clear to transparent
+        renderer.setClearColor(0x000000, 0); 
     } else {
         scene.background = new THREE.Color('#0f172a');
         scene.fog = new THREE.FogExp2('#0f172a', 0.02);
@@ -254,13 +348,64 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
     
-    // Add class for selection
     renderer.domElement.className = "garden-canvas";
     mountRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // Init Shared Geometry
-    sharedBrushGeoRef.current = new THREE.CircleGeometry(1, 12);
+    // Init Shared Geometry & Texture
+    sharedBrushGeoRef.current = new THREE.PlaneGeometry(1, 1);
+    if (!brushColorMapRef.current) {
+        const textures = createImpastoBrush();
+        if (textures) {
+            brushColorMapRef.current = textures.colorTex;
+            brushNormalMapRef.current = textures.normalTex;
+        }
+    }
+
+    // --- PAINTER RENDER TARGET SETUP ---
+    if (levelId === DifficultyLevel.PAINTER) {
+        paintRT.current = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+            minFilter: THREE.LinearFilter,
+            magFilter: THREE.LinearFilter,
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType, // Higher precision for blending
+            depthBuffer: false,
+            stencilBuffer: false,
+        });
+
+        brushScene.current = new THREE.Scene();
+        
+        // Add Studio Lights to Brush Scene for Impasto Effect
+        const brushAmbient = new THREE.AmbientLight(0xffffff, 0.6);
+        brushScene.current.add(brushAmbient);
+        
+        // Top-left strong light to cast shadows in normal map
+        const brushDirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        brushDirLight.position.set(-1, 2, 5); 
+        brushScene.current.add(brushDirLight);
+
+        // Calculate Plane Size at z=-5 to match screen
+        const canvasZ = -5;
+        const dist = camera.position.z - canvasZ; // 15
+        const height = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov)/2) * dist;
+        const width = height * camera.aspect;
+
+        const planeGeo = new THREE.PlaneGeometry(width, height);
+        const planeMat = new THREE.MeshBasicMaterial({ 
+            map: paintRT.current.texture,
+            transparent: true,
+            opacity: 1,
+            side: THREE.DoubleSide
+        });
+        
+        paintQuad.current = new THREE.Mesh(planeGeo, planeMat);
+        paintQuad.current.position.set(0, camera.position.y, canvasZ);
+        camera.lookAt(0, 5, 0); 
+        
+        scene.add(paintQuad.current);
+    } else {
+        camera.lookAt(0, 0, 0);
+    }
 
     // 2. Add Lights
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
@@ -281,14 +426,6 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
     const particlesGroup = new THREE.Group();
     particlesRef.current = particlesGroup;
     scene.add(particlesGroup);
-    
-    const ripplesGroup = new THREE.Group();
-    ripplesRef.current = ripplesGroup;
-    scene.add(ripplesGroup);
-    
-    const brushGroup = new THREE.Group();
-    brushStrokesRef.current = brushGroup;
-    scene.add(brushGroup);
     
     // Ground
     const groundGeo = new THREE.PlaneGeometry(100, 100);
@@ -359,55 +496,85 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
           
           // Painter Mode logic
           if (levelId === DifficultyLevel.PAINTER) {
-             // Calculate cursor pos for Hovering
              const aspect = window.innerWidth / window.innerHeight;
-             const canvasZ = -5; // Fixed drawing plane
-             const frustumHeight = 2.0 * Math.tan((camera.fov * Math.PI / 180) / 2) * Math.abs(canvasZ - camera.position.z);
+             const canvasZ = -5; // Fixed drawing plane relative to camera
+             const dist = camera.position.z - canvasZ; // 15
+             
+             // Frustum dimensions at depth Z
+             const frustumHeight = 2.0 * Math.tan((camera.fov * Math.PI / 180) / 2) * dist;
              const frustumWidth = frustumHeight * aspect;
              
-             // X comes in flipped (0..1 where 0 is Left, 1 is Right in 3D logic due to HandScanner flip)
+             // Map normalized cursor (0..1) to World Plane
              const worldX = (x - 0.5) * frustumWidth; 
              const worldY = -(y - 0.5) * frustumHeight + camera.position.y;
              const worldZ = canvasZ;
 
-             // Show 3D cursor so user knows where they are
+             // Show 3D cursor
              cursor.position.set(worldX, worldY, worldZ);
              cursor.visible = true; 
              cursor.material.color.set(interactionRef.current.activeColor || '#ffffff');
              cursor.renderOrder = 999999;
              cursor.material.depthTest = false;
              
-             // Process Paint Strokes
-             if (cursors.length > 0) {
+             // --- PERSISTENT PAINTING BUFFER LOGIC ---
+             if (cursors.length > 0 && paintRT.current && brushScene.current) {
                  cursors.forEach(c => {
-                     // Re-calculate based on cursor's specific position
+                     // Current frame position
                      const strokeX = (c.x - 0.5) * frustumWidth;
                      const strokeY = -(c.y - 0.5) * frustumHeight + camera.position.y;
                      
-                     // Interpolation Logic: Fill gap between frames
+                     // Interpolation: Splat many small circles between last pos and new pos
                      if (lastPaintPos.current && c.color !== '#000000') {
-                        const dist = Math.hypot(strokeX - lastPaintPos.current.x, strokeY - lastPaintPos.current.y);
-                        // Tighter step density for smoother lines
-                        const STEP = 0.1;
-                        if (dist > STEP) {
-                            const steps = Math.min(50, Math.floor(dist / STEP));
+                        const distMove = Math.hypot(strokeX - lastPaintPos.current.x, strokeY - lastPaintPos.current.y);
+                        
+                        // Calculate angle for stroke direction (aligned with texture streaks)
+                        let angle = Math.atan2(strokeY - lastPaintPos.current.y, strokeX - lastPaintPos.current.x);
+                        // Add slight jitter for organic feel
+                        angle += (Math.random() - 0.5) * 0.2;
+
+                        // Ultra-fine step for high resolution solid line
+                        const STEP = 0.005; 
+                        
+                        if (distMove > STEP) {
+                            const steps = Math.min(200, Math.floor(distMove / STEP));
                             for (let i = 1; i <= steps; i++) {
                                 const t = i / steps;
                                 const lx = lastPaintPos.current.x + (strokeX - lastPaintPos.current.x) * t;
                                 const ly = lastPaintPos.current.y + (strokeY - lastPaintPos.current.y) * t;
-                                spawnBrushParticle(lx, ly, canvasZ, c.color, c.size, c.vx, c.vy);
+                                
+                                spawnBrushSplat(lx, ly, canvasZ, c.color, c.size, angle);
                             }
                         }
-                     }
-
-                     // Only paint if active
-                     if (c.color !== '#000000') {
-                        spawnBrushParticle(strokeX, strokeY, canvasZ, c.color, c.size, c.vx, c.vy);
+                        
+                        spawnBrushSplat(strokeX, strokeY, canvasZ, c.color, c.size, angle);
                         lastPaintPos.current = { x: strokeX, y: strokeY };
+
+                     } else {
+                         // First dot of stroke
+                         if (c.color !== '#000000') {
+                            spawnBrushSplat(strokeX, strokeY, canvasZ, c.color, c.size, Math.random() * Math.PI * 2);
+                            lastPaintPos.current = { x: strokeX, y: strokeY };
+                         }
                      }
                  });
+
+                 // RENDER NEW BRUSH STROKES TO TEXTURE
+                 renderer.setRenderTarget(paintRT.current);
+                 renderer.autoClear = false; // Keep previous paint
+                 renderer.render(brushScene.current, camera); // Render only new splats
+                 renderer.setRenderTarget(null); // Back to screen
+                 
+                 // Clear the brush scene so we don't re-render these splats next frame
+                 brushScene.current.clear();
+                 // Re-add lights that were cleared (StandardMaterial needs them!)
+                 if (brushScene.current.children.length === 0) {
+                     const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+                     brushScene.current.add(ambient);
+                     const dir = new THREE.DirectionalLight(0xffffff, 1.5);
+                     dir.position.set(-1, 2, 5);
+                     brushScene.current.add(dir);
+                 }
              } else {
-                 // Reset interpolation if painting stops
                  lastPaintPos.current = null;
              }
 
@@ -415,17 +582,14 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
              // Normal Cursor Logic
              const vec = new THREE.Vector3();
              const pos = new THREE.Vector3();
-             // X is normalized. If flipped upstream, 0->1.
              vec.set( (x * 2) - 1, -(y * 2) + 1, 0.5 );
              vec.unproject(camera);
              vec.sub(camera.position).normalize();
              
-             // Wallball intersects Z=-8
              if (levelId === DifficultyLevel.WALLBALL) {
                  const distZ = (-8 - camera.position.z) / vec.z;
                  pos.copy(camera.position).add(vec.multiplyScalar(distZ));
              } else {
-                 // Garden intersects Y=0
                  if (Math.abs(vec.y) > 0.001) {
                     const distY = (0 - camera.position.y) / vec.y; 
                     pos.copy(camera.position).add(vec.multiplyScalar(distY));
@@ -500,6 +664,9 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
          }
       }
 
+      // Main Render to Screen
+      renderer.setRenderTarget(null);
+      renderer.autoClear = true; 
       // Force transparency clear for AR
       if (levelId === DifficultyLevel.PAINTER) {
           renderer.setClearColor(0x000000, 0);
@@ -514,6 +681,31 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
         camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix();
         renderer.setSize(window.innerWidth, window.innerHeight);
+        
+        // Re-create RT on resize to avoid stretching (This clears the art, but necessary for now)
+        if (paintRT.current) {
+            paintRT.current.dispose();
+            paintRT.current = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+                minFilter: THREE.LinearFilter,
+                magFilter: THREE.LinearFilter,
+                format: THREE.RGBAFormat,
+                type: THREE.HalfFloatType,
+                depthBuffer: false,
+                stencilBuffer: false,
+            });
+            if (paintQuad.current) {
+                // Update plane size
+                const aspect = window.innerWidth / window.innerHeight;
+                const canvasZ = -5;
+                const dist = camera.position.z - canvasZ;
+                const height = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov)/2) * dist;
+                const width = height * aspect;
+                paintQuad.current.geometry.dispose();
+                paintQuad.current.geometry = new THREE.PlaneGeometry(width, height);
+                (paintQuad.current.material as THREE.MeshBasicMaterial).map = paintRT.current.texture;
+                (paintQuad.current.material as THREE.MeshBasicMaterial).needsUpdate = true;
+            }
+        }
     };
     window.addEventListener('resize', handleResize);
 
@@ -524,8 +716,11 @@ export const GardenScene: React.FC<GardenSceneProps> = ({ activeEvent, eventPayl
             mountRef.current.removeChild(rendererRef.current.domElement);
             rendererRef.current.dispose();
         }
+        if (paintRT.current) paintRT.current.dispose();
+        if (brushColorMapRef.current) brushColorMapRef.current.dispose();
+        if (brushNormalMapRef.current) brushNormalMapRef.current.dispose();
     };
-  }, [levelId]); // DO NOT include activeEvent here to avoid canvas reset
+  }, [levelId]); 
 
   return <div ref={mountRef} className="absolute inset-0 pointer-events-none" />;
 };
