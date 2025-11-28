@@ -3,7 +3,8 @@ export enum DifficultyLevel {
   GARDEN = 'GARDEN',
   ARCADE = 'ARCADE',
   WALLBALL = 'WALLBALL',
-  GUITAR = 'GUITAR'
+  GUITAR = 'GUITAR',
+  PAINTER = 'PAINTER'
 }
 
 export interface LevelConfig {
@@ -30,10 +31,24 @@ export type GardenEvent =
   | 'GESTURE_SHOOT'   // Finger Gun -> Laser
   | 'GESTURE_PLAY_NOTE' // Guitar Fretboard interaction
   | 'GESTURE_STRUM'   // Guitar Strum interaction
+  | 'GESTURE_PAINT'   // Painting active
+  | 'COLOR_CHANGE'    // Palette interaction
+  | 'SAVE_SNAPSHOT'   // Save image command
   | 'BLOOM'           // Environmental trigger
   | 'WIND'            // Environmental trigger
   | 'SUN'             // Environmental trigger
   | 'NIGHT';          // Environmental trigger
+
+export interface PainterCursor {
+  id: string; // 'index', 'middle', 'ring'
+  x: number;
+  y: number;
+  z: number;
+  vx: number; // Screen velocity X
+  vy: number; // Screen velocity Y
+  color: string;
+  size: number;
+}
 
 // Mutable state for high-frequency updates (Shared between HandScanner and GardenScene)
 export interface GardenInteractionState {
@@ -50,6 +65,13 @@ export interface GardenInteractionState {
   isGrabbing: boolean;
   isPointing: boolean; // Laser mode
   isHovering: boolean; // Hand detected?
+  
+  // Painter Mode Specifics
+  isPainting: boolean;
+  brushSize: number; // 1 = Thin, 2 = Thick
+  activeColor: string; // Hex code for primary
+  painterColors: { index: string; middle: string; ring: string }; // Per-finger colors
+  cursors: PainterCursor[]; // Multi-touch pointers
 
   // Physics Velocities
   velocityX: number; // Screen X

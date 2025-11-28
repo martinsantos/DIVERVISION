@@ -9,30 +9,37 @@ interface LevelSelectorProps {
 export const LEVELS: LevelConfig[] = [
   {
     id: DifficultyLevel.GARDEN,
-    title: 'Zen Garden',
-    description: 'Create Life. Clasp hands to PLANT, Pinch to MOVE flowers.',
-    systemInstruction: `You are a Zen Master. Focus on creation and arrangement.`,
+    title: 'Jardín Zen',
+    description: 'Crea Vida. Junta las manos para PLANTAR, Pellizca para MOVER flores.',
+    systemInstruction: `You are a Zen Master interacting in Spanish. Focus on creation and arrangement.`,
     color: 'bg-emerald-500'
   },
   {
+    id: DifficultyLevel.PAINTER,
+    title: 'Pintor Aéreo',
+    description: 'Dedo Índice mueve el cursor. ¡PELLIZCA para pintar! Usa el menú lateral para guardar.',
+    systemInstruction: `You are an Art Critic interacting in Spanish. Comment on the user's creativity and color choices.`,
+    color: 'bg-purple-500'
+  },
+  {
     id: DifficultyLevel.ARCADE,
-    title: 'Laser Arcade',
-    description: 'Eradicate! Use "Finger Gun" to shoot lasers and clear the garden.',
-    systemInstruction: `You are a Sci-Fi Commander. Destroy targets.`,
+    title: 'Arcade Láser',
+    description: '¡Erradica! Haz "Pistola con Dedos" para disparar láseres y limpiar el jardín.',
+    systemInstruction: `You are a Sci-Fi Commander interacting in Spanish. Destroy targets.`,
     color: 'bg-pink-600'
   },
   {
     id: DifficultyLevel.WALLBALL,
-    title: 'Wall Ball',
-    description: 'Squash Mode. Hit the ball against the wall targets!',
-    systemInstruction: `You are a Sport Coach. Encouraging the user to hit the ball hard.`,
+    title: 'Frontón',
+    description: 'Modo Squash. ¡Golpea la pelota contra los objetivos de la pared!',
+    systemInstruction: `You are a Sport Coach interacting in Spanish. Encouraging the user to hit the ball hard.`,
     color: 'bg-orange-500'
   },
   {
     id: DifficultyLevel.GUITAR,
-    title: 'Air Guitar',
-    description: 'Play Music. Press the virtual fretboard to make sound.',
-    systemInstruction: `You are a Music Teacher. Guide the user's rhythm.`,
+    title: 'Guitarra Aérea',
+    description: 'Toca Música. Pellizca el diapasón virtual para crear melodías.',
+    systemInstruction: `You are a Music Teacher interacting in Spanish. Guide the user's rhythm.`,
     color: 'bg-indigo-600'
   }
 ];
@@ -51,11 +58,12 @@ export const LevelSelector: React.FC<LevelSelectorProps> = ({ onSelect }) => {
           <p className="text-white/80">{level.description}</p>
           <div className="mt-4 flex items-center text-sm font-medium text-white/60 group-hover:text-white">
             <span className="bg-white/10 px-2 py-1 rounded text-xs mr-2">
-              GAME
+              JUEGO
             </span>
-            {level.id === DifficultyLevel.GUITAR ? 'Musical Instrument' : 
-             level.id === DifficultyLevel.WALLBALL ? 'Physics Sport' :
-             level.id === DifficultyLevel.ARCADE ? 'Shooter' : 'Sandbox'}
+            {level.id === DifficultyLevel.GUITAR ? 'Instrumento Musical' : 
+             level.id === DifficultyLevel.WALLBALL ? 'Deporte Físico' :
+             level.id === DifficultyLevel.PAINTER ? 'Creatividad' :
+             level.id === DifficultyLevel.ARCADE ? 'Disparos' : 'Relajación'}
           </div>
         </button>
       ))}

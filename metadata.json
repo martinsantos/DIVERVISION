@@ -1,6 +1,6 @@
 {
-  "name": "GuitarVision AI",
-  "description": "Real-time AI guitar coach using Multimodal Gemini Live API to analyze playing and posture.",
+  "name": "DIVERVISIONES!",
+  "description": "Juegos para interactuar sólo con tu cámara.",
   "requestFramePermissions": [
     "camera",
     "microphone"
