@@ -23,7 +23,7 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ level, onExit }) => {
   // State to hold both the event type and its data payload
   const [activeEventData, setActiveEventData] = useState<{type: GardenEvent, payload?: any} | null>(null);
 
-  // Shared Mutable State for High-Performance Hand Tracking
+  // Shared Mutable State for high-frequency updates (Shared between HandScanner and GardenScene)
   const interactionRef = useRef<GardenInteractionState>({
     x: 0.5,
     y: 0.5,
@@ -179,6 +179,7 @@ export const LiveSession: React.FC<LiveSessionProps> = ({ level, onExit }) => {
                  <div className="grid grid-cols-[20px_1fr] gap-1">
                     <span>👆</span> <span><b>ÍNDICE</b>: Mover Cursor</span>
                     <span>👌</span> <span><b>PELLIZCAR</b>: Pintar/Click</span>
+                    <span>👏</span> <span><b>APLAUDIR</b>: Borrar Todo</span>
                  </div>
                 </>
             );
